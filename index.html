@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <link rel="manifest" href="manifest.json">
+    <title>Cardio Temple Run</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; font-family: sans-serif; user-select: none; }
+        canvas { display: block; }
+        
+        /* --- CAMERA PREVIEW --- */
+        #webcam-container {
+            position: absolute; bottom: 10px; right: 10px;
+            width: 200px; height: 150px; z-index: 100;
+            border: 2px solid #00ff00; border-radius: 8px;
+            background: #000; overflow: hidden;
+            transform: scaleX(-1); /* Mirror by default */
+        }
+        #webcam { width: 100%; height: 100%; object-fit: cover; opacity: 0.6; }
+        #skeleton-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+
+        /* --- UI OVERLAYS --- */
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 50; }
+        
+        .hud-panel {
+            position: absolute; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px);
+            padding: 15px; border-radius: 10px; color: white; border: 1px solid #444;
+            pointer-events: auto; /* Allow clicking buttons */
+        }
+
+        #controls-panel { top: 10px; left: 10px; }
+        #status-panel { top: 10px; right: 10px; text-align: right; }
+        
+        button {
+            background: #333; color: white; border: 1px solid #666;
+            padding: 8px 12px; border-radius: 4px; font-weight: bold; cursor: pointer;
+            margin-right: 5px; margin-top: 5px;
+        }
+        button.active { background: #00ff00; color: black; border-color: #00ff00; }
+        
+        #loading {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; color: #00ff00; display: flex; flex-direction: column;
+            justify-content: center; align-items: center; z-index: 999;
+        }
+    </style>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+</head>
+<body>
+
+    <div id="loading">
+        <h2>LOADING AI ENGINE...</h2>
+        <p>First run requires internet to cache models.</p>
+    </div>
+
+    <div id="ui-layer">
+        <div class="hud-panel" id="controls-panel">
+            <h3 style="margin:0 0 10px 0;">CONTROLS</h3>
+            <button id="btn-demo" onclick="toggleDemoMode()">🛠 DEMO MODE</button>
+            <button id="btn-mirror" onclick="toggleMirror()">📺 TV FLIP</button>
+            <div id="debug-info" style="margin-top:10px; font-size:12px; color:#aaa;">Waiting for pose...</div>
+        </div>
+
+        <div class="hud-panel" id="status-panel">
+            <div id="pose-cmd" style="font-size:30px; font-weight:bold; color:#00ff00">--</div>
+            <div style="font-size:12px; color:#ccc;">CURRENT ACTION</div>
+        </div>
+    </div>
+
+    <div id="webcam-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="skeleton-canvas"></canvas>
+    </div>
+
+    <script>
+        // =====================================
+        // 0. SERVICE WORKER REGISTRATION
+        // =====================================
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('./sw.js')
+                .then(() => console.log('Offline Worker Registered'))
+                .catch(err => console.log('SW Fail:', err));
+        }
+
+        // =====================================
+        // 1. APP STATE & CONFIG
+        // =====================================
+        const state = {
+            isDemo: false,
+            isMirrored: true,
+            isLoaded: false,
+            cmd: "RUN",
+            smoothX: 0, smoothY: 0,
+            baseline: { x: 0, y: 0, set: false }
+        };
+
+        // =====================================
+        // 2. AI ENGINE (TENSORFLOW)
+        // =====================================
+        let detector, video, ctxSkeleton;
+
+        async function initAI() {
+            // Enable Prod Mode for performance
+            tf.enableProdMode();
+            
+            // MoveNet Lightning is fast on mobile GPUs
+            const detectorConfig = { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING };
+            detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, detectorConfig);
+            
+            setupCamera();
+        }
+
+        async function setupCamera() {
+            video = document.getElementById('webcam');
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: 'user', width: 640, height: 480 }
+            });
+            video.srcObject = stream;
+            
+            video.onloadedmetadata = () => {
+                video.play();
+                document.getElementById('loading').style.display = 'none';
+                
+                // Setup Skeleton Canvas
+                const canvas = document.getElementById('skeleton-canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctxSkeleton = canvas.getContext('2d');
+
+                runInferenceLoop();
+                startGame(); // Start Phaser
+            };
+        }
+
+        async function runInferenceLoop() {
+            const poses = await detector.estimatePoses(video);
+            
+            // clear skeleton canvas
+            ctxSkeleton.clearRect(0, 0, ctxSkeleton.canvas.width, ctxSkeleton.canvas.height);
+
+            if (poses.length > 0) {
+                const kp = poses[0].keypoints;
+                processPose(kp);
+                
+                if (state.isDemo) {
+                    drawSkeleton(kp);
+                }
+            }
+            requestAnimationFrame(runInferenceLoop);
+        }
+
+        function processPose(kp) {
+            const nose = kp.find(k => k.name === 'nose');
+            const leftS = kp.find(k => k.name === 'left_shoulder');
+            const rightS = kp.find(k => k.name === 'right_shoulder');
+            
+            if (!nose || !leftS || !rightS || nose.score < 0.3) return;
+
+            const currX = nose.x;
+            const currY = (leftS.y + rightS.y) / 2;
+
+            // Simple smoothing (Lerp)
+            const alpha = 0.5; 
+            state.smoothX = (state.smoothX * (1-alpha)) + (currX * alpha);
+            state.smoothY = (state.smoothY * (1-alpha)) + (currY * alpha);
+
+            // Auto-calibration on first reliable pose
+            if (!state.baseline.set) {
+                state.baseline.x = state.smoothX;
+                state.baseline.y = state.smoothY;
+                state.baseline.set = true;
+                return;
+            }
+
+            // Logic
+            const dy = state.smoothY - state.baseline.y;
+            const dx = state.smoothX - state.baseline.x;
+            
+            let txt = "RUN";
+            if (dy < -40) txt = "JUMP";
+            else if (dy > 40) txt = "DUCK";
+            else if (dx < -50) txt = "RIGHT"; // Mirrored
+            else if (dx > 50) txt = "LEFT";
+
+            state.cmd = txt;
+            document.getElementById('pose-cmd').innerText = txt;
+            document.getElementById('debug-info').innerText = `Y: ${Math.round(dy)} | X: ${Math.round(dx)}`;
+        }
+
+        function drawSkeleton(keypoints) {
+            ctxSkeleton.fillStyle = 'red';
+            ctxSkeleton.strokeStyle = 'lime';
+            ctxSkeleton.lineWidth = 4;
+
+            // Draw points
+            keypoints.forEach(k => {
+                if(k.score > 0.3) {
+                    ctxSkeleton.beginPath();
+                    ctxSkeleton.arc(k.x, k.y, 5, 0, 2*Math.PI);
+                    ctxSkeleton.fill();
+                }
+            });
+            
+            // Simple bounding box for body
+            // (You can add line connections here if you want a full stick figure)
+        }
+
+        // =====================================
+        // 3. GAME ENGINE (PHASER)
+        // =====================================
+        let player, speed = 8;
+        
+        function startGame() {
+            new Phaser.Game({
+                type: Phaser.AUTO,
+                width: window.innerWidth, height: window.innerHeight,
+                parent: document.body,
+                transparent: true, // Allow seeing background color
+                physics: { default: 'arcade', arcade: { gravity: { y: 1500 } } },
+                scene: { preload, create, update }
+            });
+        }
+
+        function preload() {
+            this.load.image('ground', 'https://labs.phaser.io/assets/sprites/platform.png');
+            // We use graphics for player to keep download small
+        }
+
+        function create() {
+            // Textures
+            let g = this.make.graphics().fillStyle(0x00ff00).fillRect(0,0,50,50);
+            g.generateTexture('player', 50, 50);
+            
+            g.clear().fillStyle(0xff0000).fillRect(0,0,50,50);
+            g.generateTexture('obstacle', 50, 50);
+
+            // World
+            this.ground = this.add.tileSprite(window.innerWidth/2, window.innerHeight-20, window.innerWidth, 40, 'ground');
+            this.physics.add.existing(this.ground, true);
+
+            // Player
+            player = this.physics.add.sprite(200, window.innerHeight-100, 'player');
+            this.physics.add.collider(player, this.ground);
+            
+            // Obstacles Group
+            this.obstacles = this.physics.add.group();
+            
+            // Spawner
+            this.time.addEvent({ delay: 1500, callback: spawn, callbackScope: this, loop: true });
+        }
+
+        function update() {
+            this.ground.tilePositionX += speed;
+
+            // AI Control
+            if (state.cmd === "JUMP" && player.body.touching.down) player.setVelocityY(-800);
+            if (state.cmd === "DUCK") player.setDisplaySize(50, 25).setOffset(0, 25);
+            else player.setDisplaySize(50, 50).setOffset(0,0);
+
+            if (state.cmd === "LEFT") player.x -= 5;
+            if (state.cmd === "RIGHT") player.x += 5;
+
+            // Move Obstacles
+            this.obstacles.getChildren().forEach(obs => {
+                obs.x -= speed;
+                if (obs.x < -100) obs.destroy();
+            });
+        }
+
+        function spawn() {
+            if (state.isDemo) return; // NO SPAWNS IN DEMO MODE
+
+            const type = Phaser.Math.Between(0, 2);
+            let obs;
+            
+            if (type === 0) { // Jump over
+                obs = this.obstacles.create(window.innerWidth, window.innerHeight-50, 'obstacle');
+                obs.body.allowGravity = false;
+            } else if (type === 1) { // Duck under
+                obs = this.obstacles.create(window.innerWidth, window.innerHeight-150, 'obstacle');
+                obs.body.allowGravity = false;
+                obs.setDisplaySize(50, 20);
+            }
+        }
+
+        // =====================================
+        // 4. UI HANDLERS
+        // =====================================
+        function toggleDemoMode() {
+            state.isDemo = !state.isDemo;
+            const btn = document.getElementById('btn-demo');
+            btn.classList.toggle('active');
+            btn.innerText = state.isDemo ? "DEBUG ON" : "🛠 DEMO MODE";
+            
+            // Reset Phaser scene or just clear obstacles
+            // Simple way: User can just watch the skeleton
+        }
+
+        function toggleMirror() {
+            state.isMirrored = !state.isMirrored;
+            const val = state.isMirrored ? -1 : 1;
+            document.getElementById('webcam-container').style.transform = `scaleX(${val})`;
+            
+            // Also flip the game text if needed for TV
+            document.body.style.transform = state.isMirrored ? "none" : "scaleX(-1)";
+        }
+
+        // Start
+        initAI();
+
+    </script>
+</body>
+</html>

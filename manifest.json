@@ -1,0 +1,16 @@
+{
+  "name": "Cardio Temple Run",
+  "short_name": "CardioRun",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#222222",
+  "theme_color": "#00ff00",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/76/76666.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
