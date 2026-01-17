@@ -71,36 +71,62 @@ export default class CalibrationScene extends Phaser.Scene {
     }
 
     async runCalibration() {
-        this.instructions.setText('Stand still in a comfortable position...');
-        this.subtext.setText('Calibrating...');
+        // Step 1: Stand
+        this.instructions.setText('Step 1: Stand Still');
+        this.subtext.setText('Calibrating center...');
+        await this.wait(2000); // Give them time to read
 
-        // Visual countdown or effect could go here
-
-        const success = await PoseService.calibrate(2000); // 2 seconds
-
-        if (success) {
-            this.instructions.setText('Great! Calibration Complete.');
-            this.subtext.setText('Raise hand to PLAY or wait to redo.');
-
-            // Allow start game via gesture
-            PoseService.callbacks.onGesture = (gesture) => {
-                if (gesture === 'hand-raised') {
-                    PoseService.stopDetection();
-                    this.scene.start('Game');
-                }
-            };
-
-            // Or timeout to return to menu
-            this.time.delayedCall(10000, () => {
-                // If they don't gesture, maybe just stay here or reset
-                this.startCalibrationFlow(); // Reset so they can try again
-            });
-
-        } else {
-            this.instructions.setText('Calibration Failed.');
-            this.subtext.setText('Could not see full body. Try again.');
-            this.time.delayedCall(2000, () => this.startCalibrationFlow());
+        const standSuccess = await PoseService.calibrateStand(2000);
+        if (!standSuccess) {
+            this.handleFailure('Could not detect standing pose.');
+            return;
         }
+
+        // Step 2: Duck
+        this.instructions.setText('Step 2: DUCK DOWN\nand hold it');
+        this.subtext.setText('Get ready...');
+        await this.wait(2000);
+
+        this.subtext.setText('Calibrating duck...');
+        const duckSuccess = await PoseService.calibrateDuck(2000);
+        if (!duckSuccess) {
+            this.handleFailure('Could not detect ducking pose.');
+            return;
+        }
+
+        // Step 3: Jump
+        this.instructions.setText('Step 3: JUMP UP HIGH!\n(Do it when you see "Calibrating")');
+        this.subtext.setText('Get ready...');
+        await this.wait(2000);
+
+        this.subtext.setText('Calibrating jump... JUMP NOW!');
+        const jumpSuccess = await PoseService.calibrateJump(1500); // Shorter window for jump
+        if (!jumpSuccess) {
+            this.handleFailure('Could not detect jump.');
+            return;
+        }
+
+        // Success
+        this.instructions.setText('Calibration Complete!');
+        this.subtext.setText('Raise hand to PLAY.');
+
+        // Allow start game via gesture
+        PoseService.callbacks.onGesture = (gesture) => {
+            if (gesture === 'hand-raised') {
+                PoseService.stopDetection();
+                this.scene.start('Game');
+            }
+        };
+    }
+
+    handleFailure(msg) {
+        this.instructions.setText('Calibration Failed');
+        this.subtext.setText(msg + ' Retrying...');
+        this.time.delayedCall(3000, () => this.startCalibrationFlow());
+    }
+
+    wait(ms) {
+        return new Promise(resolve => this.time.delayedCall(ms, resolve));
     }
 
     createButton(x, y, text, callback) {

@@ -19,9 +19,11 @@ class PoseService {
 
         // Calibration data
         this.calibration = {
-            baselineNoseY: null,
-            baselineShoulderY: null,
-            shoulderWidth: null
+            baselineNoseY: null,     // Keep for debug/backup
+            baselineShoulderY: null, // Main reference
+            shoulderWidth: null,     // Reference width
+            duckRatio: null,         // (DuckY - StandY) / Width
+            jumpRatio: null          // (StandY - JumpY) / Width
         };
 
         this.jumpThresholdRatio = 0.5;
@@ -113,6 +115,12 @@ class PoseService {
             onProgress?.('Ready!');
 
             this.loadCalibration();
+
+            // If we have full calibration, mark as calibrated
+            if (this.calibration.baselineShoulderY && this.calibration.duckRatio && this.calibration.jumpRatio) {
+                this.isCalibrated = true;
+            }
+
             return true;
         } catch (error) {
             console.error('PoseService init error:', error);
@@ -133,7 +141,16 @@ class PoseService {
     startDetection(callbacks = {}) {
         if (!this.isModelLoaded) return;
 
-        this.callbacks = { ...this.callbacks, ...callbacks };
+        // Reset callbacks to ensure no lingering events (like 'onGesture' from previous scene)
+        this.callbacks = {
+            onJump: null,
+            onDuck: null,
+            onStand: null,
+            onDebug: null,
+            onGesture: null,
+            ...callbacks
+        };
+
         this.isDetecting = true;
         this.showOverlay();
 
@@ -250,39 +267,37 @@ class PoseService {
     }
 
     evaluateGameplayPose(kp) {
-        const shoulderY = (kp.leftShoulder.y + kp.rightShoulder.y) / 2;
-        const shoulderWidth = Math.abs(kp.leftShoulder.x - kp.rightShoulder.x);
+        // 1. Get current shoulder stats
+        const currentShoulderY = (kp.leftShoulder.y + kp.rightShoulder.y) / 2;
+        const currentWidth = Math.abs(kp.leftShoulder.x - kp.rightShoulder.x);
 
-        // Dynamic thresholds based on current distance (shoulder width)
-        // If user moves back (width smaller), threshold should be smaller (in pixels)
-        // But relative to shoulder width remains constant
+        // 2. Calculate displacements normalized by CURRENT width
+        // This makes it robust to moving closer/further
+        const diffY = currentShoulderY - this.calibration.baselineShoulderY;
+        const displacementRatio = diffY / currentWidth;
 
-        // We use the calibrated 'reference' shoulder width to normalize or just use current
-        // Using current is better for dynamic movement
+        // Note: Y increases downwards.
+        // Jump: Moving UP -> Y decreases -> diffY is negative.
+        // Duck: Moving DOWN -> Y increases -> diffY is positive.
 
-        const jumpThresh = shoulderWidth * this.jumpThresholdRatio;
-        const duckThresh = shoulderWidth * this.duckThresholdRatio; // Relative to shoulder line
-
-        const noseDiff = kp.nose.y - this.calibration.baselineNoseY;
-
-        // For Ducking: Comparison is better against SHOULDER line, because nose drops relative to shoulders
-        // But baselineNoseY is "Standing Nose Y". 
-        // If we lean forward/duck, nose Y increases.
+        // 3. Compare with calibrated ratios (with 20% tolerance)
+        // jumpRatio is positive (StandY - JumpY), so we check if -displacementRatio > jumpRatio * 0.8
+        // duckRatio is positive (DuckY - StandY), so we check if displacementRatio > duckRatio * 0.8
 
         let newState = 'stand';
 
-        if (noseDiff > duckThresh) {
+        if (displacementRatio > this.calibration.duckRatio * 0.8) {
             newState = 'duck';
-        } else if (noseDiff < -jumpThresh) {
+        } else if (-displacementRatio > this.calibration.jumpRatio * 0.8) {
             newState = 'jump';
         }
 
         this.callbacks.onDebug?.({
             state: newState,
-            noseY: kp.nose.y,
-            baseline: this.calibration.baselineNoseY,
-            diff: noseDiff,
-            thresh: { jump: jumpThresh, duck: duckThresh }
+            ratio: displacementRatio.toFixed(3),
+            width: currentWidth.toFixed(0),
+            jumpThresh: -(this.calibration.jumpRatio * 0.8).toFixed(3),
+            duckThresh: (this.calibration.duckRatio * 0.8).toFixed(3)
         });
 
         if (newState !== this.lastPoseState) {
@@ -314,16 +329,80 @@ class PoseService {
     }
 
     // Calibration
-    async calibrate(duration = 2000) {
-        console.log('Calibrating...');
+    // Calibration Steps
+
+    // Step 1: Stand
+    async calibrateStand(duration = 2000) {
+        console.log('Calibrating Stand...');
+        const samples = await this.collectSamples(duration);
+        if (samples.length < 10) return false;
+
+        this.calibration.baselineNoseY = samples.reduce((a, b) => a + b.nose.y, 0) / samples.length;
+
+        // Calculate Baseline Shoulder Y
+        const avgShoulderY = samples.reduce((a, b) =>
+            a + (b.leftShoulder.y + b.rightShoulder.y) / 2, 0) / samples.length;
+        this.calibration.baselineShoulderY = avgShoulderY;
+
+        this.calibration.shoulderWidth = samples.reduce((a, b) =>
+            a + Math.abs(b.leftShoulder.x - b.rightShoulder.x), 0) / samples.length;
+
+        this.saveCalibration();
+        return true;
+    }
+
+    // Step 2: Duck
+    async calibrateDuck(duration = 2000) {
+        console.log('Calibrating Duck...');
+        const samples = await this.collectSamples(duration);
+        if (samples.length < 10) return false;
+
+        // Average shoulder Y during hold
+        const avgShoulderY = samples.reduce((a, b) =>
+            a + (b.leftShoulder.y + b.rightShoulder.y) / 2, 0) / samples.length;
+
+        // Calculate Ratio: How much did we drop relative to width?
+        // (DuckY - StandY) / Width
+        const diff = avgShoulderY - this.calibration.baselineShoulderY;
+        this.calibration.duckRatio = diff / this.calibration.shoulderWidth;
+
+        console.log(`Calibrated Duck Ratio: ${this.calibration.duckRatio}`);
+        this.saveCalibration();
+        return true;
+    }
+
+    // Step 3: Jump
+    async calibrateJump(duration = 2000) {
+        console.log('Calibrating Jump...');
+        const samples = await this.collectSamples(duration);
+        if (samples.length < 5) return false;
+
+        // Find PEAK (lowest Y) of Shoulders
+        const peakY = Math.min(...samples.map(s => (s.leftShoulder.y + s.rightShoulder.y) / 2));
+
+        // Calculate Ratio: (StandY - JumpY) / Width
+        // Expect Check: StandY > JumpY (since Y decreases up)
+        const diff = this.calibration.baselineShoulderY - peakY;
+        this.calibration.jumpRatio = diff / this.calibration.shoulderWidth;
+
+        console.log(`Calibrated Jump Ratio: ${this.calibration.jumpRatio}`);
+
+        // Finalize
+        this.isCalibrated = true;
+        this.saveCalibration();
+        return true;
+    }
+
+    async collectSamples(duration) {
         const samples = [];
         const startTime = Date.now();
+        this.showOverlay();
 
         return new Promise(resolve => {
             const collector = setInterval(async () => {
                 if (Date.now() - startTime > duration) {
                     clearInterval(collector);
-                    resolve(this.finishCalibration(samples));
+                    resolve(samples);
                     return;
                 }
 
@@ -331,46 +410,33 @@ class PoseService {
                     const poses = await this.detector.estimatePoses(this.video);
                     if (poses.length > 0) {
                         const kp = this.extractKeypoints(poses[0]);
-                        if (kp) samples.push(kp);
+                        if (kp) {
+                            samples.push(kp);
+                            // Visual feedback
+                            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                            this.drawSkeleton(poses[0]);
+                        }
                     }
                 } catch (e) { }
-            }, 50);
+            }, 30);
         });
     }
 
-    finishCalibration(samples) {
-        if (samples.length < 10) return false;
-
-        const avgNoseY = samples.reduce((a, b) => a + b.nose.y, 0) / samples.length;
-        const avgShoulderWidth = samples.reduce((a, b) =>
-            a + Math.abs(b.leftShoulder.x - b.rightShoulder.x), 0) / samples.length;
-
-        this.calibration = {
-            baselineNoseY: avgNoseY,
-            shoulderWidth: avgShoulderWidth
-        };
-
-        this.isCalibrated = true;
-        this.saveCalibration();
-        return true;
-    }
-
     saveCalibration() {
-        localStorage.setItem('exarplay_calib_v2', JSON.stringify(this.calibration));
+        localStorage.setItem('exarplay_calib_v4', JSON.stringify(this.calibration));
     }
 
     loadCalibration() {
-        const data = localStorage.getItem('exarplay_calib_v2');
+        const data = localStorage.getItem('exarplay_calib_v4');
         if (data) {
             this.calibration = JSON.parse(data);
-            this.isCalibrated = true;
         }
     }
 
     clearCalibration() {
         this.isCalibrated = false;
-        this.calibration = { baselineNoseY: null };
-        localStorage.removeItem('exarplay_calib_v2');
+        this.calibration = {};
+        localStorage.removeItem('exarplay_calib_v4');
     }
 }
 

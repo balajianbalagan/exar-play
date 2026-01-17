@@ -189,28 +189,23 @@ export default class GameScene extends Phaser.Scene {
 
     setupPoseDetection() {
         // Use the singleton PoseService
-        PoseService.startDetection(
-            // onJump
-            () => {
+        PoseService.startDetection({
+            onJump: () => {
                 if (!this.isGameOver && !this.isPaused) {
                     this.player.jump();
                 }
             },
-            // onDuck
-            () => {
+            onDuck: () => {
                 if (!this.isGameOver && !this.isPaused) {
                     this.player.duck();
                 }
             },
-            // onStand
-            () => {
+            onStand: () => {
                 if (!this.isGameOver && !this.isPaused) {
                     this.player.standUp();
                 }
-            },
-            // onDebug (optional)
-            null
-        );
+            }
+        });
     }
 
     startMusic() {
