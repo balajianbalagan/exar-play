@@ -1,0 +1,35 @@
+{
+  "name": "Exar Play",
+  "short_name": "Exar Play",
+  "description": "A pose-controlled endless runner game",
+  "start_url": "../index.html",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#1d212d",
+  "theme_color": "#4fd1c5",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    {
+      "src": "assets/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "assets/screenshot.png",
+      "sizes": "800x600",
+      "type": "image/png",
+      "form_factor": "wide"
+    }
+  ],
+  "related_applications": [],
+  "prefer_related_applications": false
+}
